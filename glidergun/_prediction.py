@@ -91,11 +91,11 @@ class GridPredictor(Generic[TPredictor]):
             np.array([g.data.ravel() for g in grids]).transpose(1, 0), **kwargs
         )
         g = grids[0]
-        return g.update(array.reshape((g.height, g.width))).type(self._dtype)
+        return g.local(array.reshape((g.height, g.width))).type(self._dtype)
 
     def _flatten(self, *grids: "Grid"):
         return [
-            g.is_nan().con(float(g.mean), g) for g in grids[0].standardize(*grids[1:])
+            g.is_nan().then(float(g.mean), g) for g in grids[0].standardize(*grids[1:])
         ]
 
     def save(self, file: str):

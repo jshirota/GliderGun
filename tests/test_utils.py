@@ -1,5 +1,6 @@
 import numpy as np
 
+from glidergun._grid import grid
 from glidergun._utils import format_type, get_nodata_value
 
 
@@ -83,3 +84,18 @@ def test_get_nodata_value_int32():
 
 def test_get_nodata_value_int64():
     assert get_nodata_value("int64") == np.iinfo("int64").min
+
+
+def test_process_tiles():
+    g = grid(".data/n55_e008_1arc_v3.bil")
+
+    def assert_eq(g2):
+        assert g2.md5 == g.md5
+        assert g2.cell_size == g.cell_size
+        assert g2.crs == g.crs
+        assert g2.extent == g.extent
+
+    assert_eq(g.process_tiles(lambda x: x, 456, 0, 2))
+    assert_eq(g.process_tiles(lambda x: x, 678, 7, 2))
+    assert_eq(g.process_tiles(lambda x: x, 3456, 0, 1))
+    assert_eq(g.process_tiles(lambda x: x, 7891, 19, 1))

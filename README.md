@@ -41,6 +41,33 @@ ndvi.plot("gist_earth")
 
 ![](image2.png)
 
+### Interpolation
+
+```python
+from glidergun import Defaults, grid
+
+Defaults.display = "cividis"
+
+dem = grid(".data/n55_e008_1arc_v3.bil").resize(10, 10)
+sparse_dem = dem.set_nan(dem.randomize() > 0.1)
+
+sparse_dem, sparse_dem.interp_idw(), sparse_dem.interp_rbf()
+```
+
+![](image3.png)
+
+### Rising Sea Level Simulation 
+
+```python
+from glidergun import grid
+
+dem = grid(".data/n55_e008_1arc_v3.bil")
+
+dem.set_nan(dem > 2).color("Blues").map(opacity=0.5, basemap="OpenStreetMap")
+```
+
+![](image4.png)
+
 ### Conway's Game of Life
 
 ```python

@@ -1,5 +1,14 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import numpy as np
 from numpy import ndarray
@@ -21,6 +30,7 @@ if TYPE_CHECKING:
 class Interpolation:
     def interp_clough_tocher(
         self,
+        points: Optional[Sequence[Tuple[float, float, float]]] = None,
         cell_size: Union[Tuple[float, float], float, None] = None,
         fill_value: float = np.nan,
         tol: float = 0.000001,
@@ -33,10 +43,13 @@ class Interpolation:
             )
 
         g = cast("Grid", self)
-        return interpolate(f, g.to_points(), g.extent, g.crs, cell_size or g.cell_size)
+        if points is None:
+            points = g.to_points()
+        return interpolate(f, points, g.extent, g.crs, cell_size or g.cell_size)
 
     def interp_linear(
         self,
+        points: Optional[Sequence[Tuple[float, float, float]]] = None,
         cell_size: Union[Tuple[float, float], float, None] = None,
         fill_value: float = np.nan,
         rescale: bool = False,
@@ -45,10 +58,13 @@ class Interpolation:
             return LinearNDInterpolator(coords, values, fill_value, rescale)
 
         g = cast("Grid", self)
-        return interpolate(f, g.to_points(), g.extent, g.crs, cell_size or g.cell_size)
+        if points is None:
+            points = g.to_points()
+        return interpolate(f, points, g.extent, g.crs, cell_size or g.cell_size)
 
     def interp_nearest(
         self,
+        points: Optional[Sequence[Tuple[float, float, float]]] = None,
         cell_size: Union[Tuple[float, float], float, None] = None,
         rescale: bool = False,
         tree_options: Any = None,
@@ -57,10 +73,13 @@ class Interpolation:
             return NearestNDInterpolator(coords, values, rescale, tree_options)
 
         g = cast("Grid", self)
-        return interpolate(f, g.to_points(), g.extent, g.crs, cell_size or g.cell_size)
+        if points is None:
+            points = g.to_points()
+        return interpolate(f, points, g.extent, g.crs, cell_size or g.cell_size)
 
     def interp_rbf(
         self,
+        points: Optional[Sequence[Tuple[float, float, float]]] = None,
         cell_size: Union[Tuple[float, float], float, None] = None,
         neighbors: Optional[int] = None,
         smoothing: float = 0,
@@ -74,19 +93,25 @@ class Interpolation:
             )
 
         g = cast("Grid", self)
-        return interpolate(f, g.to_points(), g.extent, g.crs, cell_size or g.cell_size)
+        if points is None:
+            points = g.to_points()
+        return interpolate(f, points, g.extent, g.crs, cell_size or g.cell_size)
 
 
 def interpolate(
     interpolator_factory: Callable[[ndarray, ndarray], Any],
-    points: Iterable[Tuple[float, float, float]],
+    points: Sequence[Tuple[float, float, float]],
     extent: Tuple[float, float, float, float],
     crs: Union[int, CRS],
     cell_size: Union[Tuple[float, float], float],
 ):
     from glidergun._grid import grid
 
-    points = list(points)
+    g = grid(np.nan, extent, crs, cell_size)
+
+    if len(points) == 0:
+        return g
+
     coords = np.array([p[:2] for p in points])
     values = np.array([p[2] for p in points])
     g = grid(np.nan, extent, crs, cell_size)
@@ -95,4 +120,4 @@ def interpolate(
     ys = np.linspace(g.ymax, g.ymin, g.height)
     array = np.array([[x0, y0] for x0 in xs for y0 in ys])
     data = interp(array).reshape((g.width, g.height)).transpose(1, 0)
-    return g.update(data)
+    return g.local(data)

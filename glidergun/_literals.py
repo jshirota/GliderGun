@@ -2,8 +2,12 @@ from typing import Literal
 
 BaseMap = Literal[
     "OpenStreetMap",
-    "Cartodb Positron",
-    "Cartodb dark_matter",
+    "light_all",
+    "light_nolabels",
+    "light_only_labels",
+    "dark_all",
+    "dark_nolabels",
+    "dark_only_labels",
 ]
 
 ColorMap = Literal[

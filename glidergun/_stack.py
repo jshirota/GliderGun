@@ -25,7 +25,7 @@ from glidergun._grid import (
 )
 from glidergun._literals import BaseMap, DataType
 from glidergun._types import Scaler
-from glidergun._utils import create_parent_directory, get_crs, get_nodata_value
+from glidergun._utils import create_directory, get_crs, get_nodata_value
 
 Operand = Union["Stack", Grid, float, int]
 
@@ -44,9 +44,6 @@ class Stack:
             figure = plt.figure(figsize=figsize, frameon=False)
             axes = figure.add_axes((0, 0, 1, 1))
             axes.axis("off")
-            n = 4000 / max(self.grids[0].width, self.grids[0].height)
-            if n < 1:
-                obj = self.resample(self.grids[0].cell_size / n)
             obj = self.to_uint8_range()
             rgb = [
                 obj.grids[i - 1].data
@@ -248,8 +245,17 @@ class Stack:
     ):
         return self.each(lambda g: g.georeference(xmin, ymin, xmax, ymax, crs))
 
+    def tiles(self, width: float, height: float):
+        return (
+            stack(*grids)
+            for grids in zip(*(g.tiles(width, height) for g in self.grids))
+        )
+
     def clip(self, xmin: float, ymin: float, xmax: float, ymax: float):
         return self.each(lambda g: g.clip(xmin, ymin, xmax, ymax))
+
+    def clip_at(self, x: float, y: float, width: int = 8, height: int = 8):
+        return self.each(lambda g: g.clip_at(x, y, width, height))
 
     def extract_bands(self, *bands: int):
         return stack(*(self.grids[i - 1] for i in bands))
@@ -278,8 +284,8 @@ class Stack:
             grids.append(func(grid1, grid2))
         return stack(*grids)
 
-    def values(self, x: float, y: float):
-        return tuple(grid.value(x, y) for grid in self.grids)
+    def value_at(self, x: float, y: float):
+        return tuple(grid.value_at(x, y) for grid in self.grids)
 
     def type(self, dtype: DataType):
         return self.each(lambda g: g.type(dtype))
@@ -314,7 +320,7 @@ class Stack:
             grids = tuple(con(g.is_nan(), float(nodata), g) for g in grids)
 
         if isinstance(file, str):
-            create_parent_directory(file)
+            create_directory(file)
             with rasterio.open(
                 file,
                 "w",

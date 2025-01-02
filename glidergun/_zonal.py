@@ -18,7 +18,7 @@ class Zonal:
             zone_value = int(zone + 0.5)
             data = g.set_nan(zone_grid != zone_value).data
             statistics = func(data[np.isfinite(data)])
-            result = (zone_grid == zone_value).con(statistics, result)  # type: ignore
+            result = (zone_grid == zone_value).then(statistics, result)  # type: ignore
         return cast("Grid", result)
 
     def zonal_count(self, value: Union[float, int], zone_grid: "Grid", **kwargs):

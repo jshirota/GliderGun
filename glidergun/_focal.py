@@ -1,6 +1,5 @@
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, List, Union, cast
 
 import numpy as np
 from numpy import ndarray
@@ -19,14 +18,16 @@ class Focal:
         circle: bool,
         max_workers: int,
     ) -> "Grid":
+        grid = cast("Grid", self)
+
         def f(g: "Grid") -> "Grid":
             size = 2 * buffer + 1
             mask = _mask(buffer) if circle else np.full((size, size), True)
             array = sliding_window_view(_pad(g.data, buffer), (size, size))
             result = func(array[:, :, mask])
-            return g.update(result)
+            return g.local(result)
 
-        return _batch(f, buffer, cast("Grid", self), max_workers)
+        return grid.process_tiles(f, 8000 // buffer, buffer, max_workers)
 
     def focal_generic(
         self,
@@ -144,17 +145,19 @@ class Focal:
         return self.focal(lambda a: f(a, axis=2, **kwargs), buffer, circle, max_workers)
 
     def fill_nan(self, max_exponent: int = 4, max_workers: int = 1):
-        if not cast("Grid", self).has_nan:
-            return self
+        grid = cast("Grid", self)
+
+        if not grid.has_nan:
+            return grid
 
         def f(g: "Grid"):
             n = 0
             while g.has_nan and n <= max_exponent:
-                g = g.is_nan().con(g.focal_mean(2**n, True), g)
+                g = g.is_nan().then(g.focal_mean(2**n, True), g)
                 n += 1
             return g
 
-        return _batch(f, 2**max_exponent, cast("Grid", self), max_workers)
+        return grid.process_tiles(f, 256, 2**max_exponent, max_workers)
 
 
 def _mask(buffer: int) -> ndarray:
@@ -173,50 +176,3 @@ def _pad(data: ndarray, buffer: int):
     row = np.zeros((buffer, data.shape[1])) * np.nan
     col = np.zeros((data.shape[0] + 2 * buffer, buffer)) * np.nan
     return np.hstack([col, np.vstack([row, data, row]), col], dtype="float32")
-
-
-def _batch(
-    func: Callable[["Grid"], "Grid"], buffer: int, grid: "Grid", max_workers: int
-) -> "Grid":
-    def tile():
-        stride = 8000 // buffer
-        for x in range(0, grid.width // stride + 1):
-            xmin, xmax = x * stride, min((x + 1) * stride, grid.width)
-            if xmin < xmax:
-                for y in range(0, grid.height // stride + 1):
-                    ymin, ymax = y * stride, min((y + 1) * stride, grid.height)
-                    if ymin < ymax:
-                        yield xmin, ymin, xmax, ymax
-
-    tiles = list(tile())
-
-    if len(tiles) <= 4:
-        return func(grid)
-
-    result: Optional["Grid"] = None
-    cell_size = grid.cell_size
-
-    def f(tile):
-        xmin, ymin, xmax, ymax = tile
-        g = func(
-            grid.clip(
-                grid.xmin + (xmin - buffer) * cell_size.x,
-                grid.ymin + (ymin - buffer) * cell_size.y,
-                grid.xmin + (xmax + buffer) * cell_size.x,
-                grid.ymin + (ymax + buffer) * cell_size.y,
-            )
-        )
-        return g.clip(
-            grid.xmin + xmin * cell_size.x,
-            grid.ymin + ymin * cell_size.y,
-            grid.xmin + xmax * cell_size.x,
-            grid.ymin + ymax * cell_size.y,
-        )
-
-    with ThreadPoolExecutor(max_workers or 1) as executor:
-        for r in executor.map(f, tiles):
-            result = result.mosaic(r) if result else r
-
-    print()
-    assert result
-    return result

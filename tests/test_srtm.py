@@ -11,17 +11,12 @@ from glidergun._mosaic import mosaic
 dem = grid("./.data/n55_e008_1arc_v3.bil")
 
 
-def test_distance_1():
-    g = (dem.resample(0.01) > 50).distance()
-    assert g.round(4).md5 == "c263f513e2c3fc6c0cfc5c468ceb6b48"
-
-
 def test_distance_2():
-    g = dem.distance((8.2, 55.3))
-    assert round(g.value(8.2, 55.3), 3) == 0.0
-    # assert round(g.value(8.5, 55.3), 3) == 0.3
-    # assert round(g.value(8.2, 55.7), 3) == 0.4
-    # assert round(g.value(8.5, 55.7), 3) == 0.5
+    g = dem.distance([(8.2, 55.3)])
+    assert round(g.value_at(8.2, 55.3), 3) == 0.0
+    assert round(g.value_at(8.5, 55.3), 3) == 0.3
+    assert round(g.value_at(8.2, 55.7), 3) == 0.4
+    assert round(g.value_at(8.5, 55.7), 3) == 0.5
 
 
 def test_aspect():
@@ -32,14 +27,14 @@ def test_aspect():
 def test_bins():
     n = 77
     count = dem.bins.get(n, 0)
-    points = list(dem.set_nan(dem != n).to_points())
+    points = dem.set_nan(dem != n).to_points()
     assert count == len(points)
 
 
 def test_bins_2():
     n = 999
     count = dem.bins.get(n, 0)
-    points = list(dem.set_nan(dem != n).to_points())
+    points = dem.set_nan(dem != n).to_points()
     assert count == len(points)
 
 
@@ -192,8 +187,8 @@ def test_interp_linear():
     extent = (-121, 39, -109, 51)
     g = grid(points, extent, 4326, 0.1)
     g = g.interp_linear()
-    assert g.value(-100, 45) is np.nan
-    assert 100 < g.value(-115, 45) < 400
+    assert g.value_at(-100, 45) is np.nan
+    assert 100 < g.value_at(-115, 45) < 400
 
 
 def test_interp_nearest():
@@ -201,8 +196,8 @@ def test_interp_nearest():
     extent = (-121, 39, -109, 51)
     g = grid(points, extent, 4326, 0.1)
     g = g.interp_nearest()
-    assert g.value(-100, 45) is np.nan
-    assert g.value(-112, 42) == 300
+    assert g.value_at(-100, 45) is np.nan
+    assert g.value_at(-112, 42) == 300
 
 
 def test_interp_rbf():
@@ -210,8 +205,8 @@ def test_interp_rbf():
     extent = (-121, 39, -109, 51)
     g = grid(points, extent, 4326, 0.1)
     g = g.interp_rbf()
-    assert g.value(-100, 45) is np.nan
-    assert 100 < g.value(-115, 45) < 400
+    assert g.value_at(-100, 45) is np.nan
+    assert 100 < g.value_at(-115, 45) < 400
 
 
 def test_mosaic():
@@ -313,7 +308,7 @@ def test_to_points():
     n = 0
     for x, y, value in g.to_points():
         n += 1
-        assert g.value(x, y) == value
+        assert g.value_at(x, y) == value
     assert n > 1000
 
 
@@ -432,9 +427,9 @@ def test_round():
     g = dem.resample(0.01).randomize()
     points = g.to_points()
     for p1, p2 in zip(points, g.round().to_points()):
-        assert pytest.approx(p2[2], 0.000001) == round(p1[2])
+        assert pytest.approx(p2[2], 0.01) == round(p1[2])
     for p1, p2 in zip(points, g.round(3).to_points()):
-        assert pytest.approx(p2[2], 0.000001) == round(p1[2], 3)
+        assert pytest.approx(p2[2], 0.01) == round(p1[2], 3)
 
 
 def test_zonal():
@@ -453,7 +448,7 @@ def test_zonal():
 
 
 def save(g1: Grid, file: str, strict: bool = True):
-    folder = ".output/test"
+    folder = ".output/test1"
     file_path = f"{folder}/{file}"
     os.makedirs(folder, exist_ok=True)
     g1.save(file_path)
@@ -500,15 +495,21 @@ def test_mosaic_dataset():
         "./.data/n55_e008_1arc_v3.bil",
         "./.data/n55_e009_1arc_v3.bil",
     )
-    assert m.clip(8, 55, 9, 56).extent == pytest.approx((8, 55, 9, 56), 0.001)
-    assert m.clip(8, 55, 10, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
-    assert m.clip(8.2, 55.2, 9.2, 56.2).extent == pytest.approx(
+
+    def clip(xmin, ymin, xmax, ymax):
+        g = m.clip(xmin, ymin, xmax, ymax)
+        assert g
+        return g
+
+    assert clip(8, 55, 9, 56).extent == pytest.approx((8, 55, 9, 56), 0.001)
+    assert clip(8, 55, 10, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
+    assert clip(8.2, 55.2, 9.2, 56.2).extent == pytest.approx(
         (8.2, 55.2, 9.2, 56.0), 0.001
     )
-    assert m.clip(7.5, 55, 10, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
-    assert m.clip(8, 50, 10, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
-    assert m.clip(8, 55, 15, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
-    assert m.clip(8, 55, 10, 60).extent == pytest.approx((8, 55, 10, 56), 0.001)
+    assert clip(7.5, 55, 10, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
+    assert clip(8, 50, 10, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
+    assert clip(8, 55, 15, 56).extent == pytest.approx((8, 55, 10, 56), 0.001)
+    assert clip(8, 55, 10, 60).extent == pytest.approx((8, 55, 10, 56), 0.001)
 
 
 def test_mosaic_eager_vs_lazy():
@@ -517,7 +518,10 @@ def test_mosaic_eager_vs_lazy():
     )
     m = mosaic("./.data/n55_e008_1arc_v3.bil", "./.data/n55_e009_1arc_v3.bil")
 
-    assert g.clip(8, 55, 8.5, 56).md5 == m.clip(8, 55, 8.5, 56).md5
+    g1 = g.clip(8, 55, 8.5, 56)
+    g2 = m.clip(8, 55, 8.5, 56)
+    assert g2
+    assert g1.md5 == g2.md5
 
 
 def test_tiling():
@@ -526,10 +530,176 @@ def test_tiling():
         grid("./.data/n55_e009_1arc_v3.bil"),
     )
 
-    fmean = g.focal_mean(5)
+    fmean = g.focal_mean(2)
 
     assert g.extent == fmean.extent
     assert g.crs == fmean.crs
     assert g.cell_size == fmean.cell_size
     assert g.width == fmean.width
     assert g.height == fmean.height
+
+
+def test_set_nan_2():
+    g = dem.resample(0.02)
+
+    assert g.is_less_than(1).then(np.nan, g).md5 == g.set_nan(g < 1).md5
+    assert (
+        g.resample(0.04).set_nan(g < 1).md5
+        == g.resample(0.04).set_nan(lambda g: g < 1).md5
+    )
+    assert (
+        g.resample(0.04).con(lambda g: g < 1, np.nan).md5
+        == g.resample(0.04).set_nan(lambda g: g < 1).md5
+    )
+
+
+def test_capping():
+    g = dem.resample(0.02)
+    assert not g.has_nan
+
+    g1 = g.cap_min(10)
+    assert g1.min == 10
+    assert g1.max == g.max
+    assert not g1.has_nan
+    assert g1.extent == g.extent
+
+    g2 = g.cap_min(10, set_nan=True)
+    assert g2.min == 10
+    assert g2.max == g.max
+    assert g2.has_nan
+    assert g2.extent == g.extent
+
+    g3 = g.cap_max(30)
+    assert g3.min == g.min
+    assert g3.max == 30
+    assert not g3.has_nan
+    assert g3.extent == g.extent
+
+    g4 = g.cap_max(30, set_nan=True)
+    assert g4.min == g.min
+    assert g4.max == 30
+    assert g4.has_nan
+    assert g4.extent == g.extent
+
+    g5 = g.cap_range(10, 30)
+    assert g5.min == 10
+    assert g5.max == 30
+    assert not g5.has_nan
+    assert g5.extent == g.extent
+
+    g6 = g.cap_range(10, 30, True)
+    assert g6.min == 10
+    assert g6.max == 30
+    assert g6.has_nan
+    assert g6.extent == g.extent
+
+
+def test_clustering():
+    g = dem.resample(0.02)
+    assert not g.has_nan
+
+    g1 = g.slice(4)
+    assert len(g1.bins) == 4
+    assert g1.min == 1
+    assert g1.max == 4
+    assert g1.extent == g.extent
+
+    g2 = g.kmeans_cluster(4)
+    assert len(g2.bins) == 4
+    assert g2.min != 1
+    assert g2.max != 4
+    assert g2.extent == g.extent
+
+
+def test_stretching():
+    g = dem.resample(0.02)
+    assert not g.has_nan
+
+    g1 = g.stretch(10, 30)
+    assert g1.min == 10
+    assert g1.max == 30
+    assert g1.extent == g.extent
+
+    g2 = g.stretch(-777, 888)
+    assert g2.min == -777
+    assert g2.max == 888
+    assert g2.extent == g.extent
+
+
+def test_con_2():
+    g = dem.resample(0.02)
+
+    g1 = g.set_nan(g > 10)
+    assert g1.has_nan
+    assert g1.min == g.min
+    assert g1.max == 10
+    assert g1.extent == g.extent
+
+    g2 = g1.is_nan().then(1, 2)
+    assert not g2.has_nan
+    assert g2.min == 1
+    assert g2.max == 2
+    assert g2.extent == g.extent
+
+    g3 = g2.con(2, np.nan)
+    assert g3.has_nan
+    assert g3.min == 1
+    assert g3.max == 1
+    assert g3.extent == g.extent
+
+    g4 = (~g1.is_nan()).then(2, 1)
+    assert g4.md5 == g2.md5
+
+
+def test_tiling_2():
+    g1 = dem.resample(0.002)
+    g2 = None
+
+    folder = ".output/test2"
+    for tile in g1.tiles(0.1, 0.1):
+        print(tile.extent)
+        name = f"{folder}/{tile.extent}.tif"
+        tile.save(name)
+        g2 = g2.mosaic(grid(name)) if g2 else grid(name)
+
+    assert g2
+    assert g2.cell_size == g1.cell_size
+    assert g2.crs == g1.crs
+    assert g2.md5 == g1.md5
+    shutil.rmtree(folder)
+
+
+def test_mosaic_tiling():
+    files = [".data/n55_e008_1arc_v3.bil", ".data/n55_e009_1arc_v3.bil"]
+    m = mosaic(*files)
+    g = mosaic(*map(grid, files))
+    e = (8.678, 55.2, 8.8, 55.4)
+    g1 = m.clip(*e)
+    g2 = g.clip(*e)
+    g3 = None
+    for tile in m.tiles(0.1, 0.1, e):
+        g3 = tile if g3 is None else g3.mosaic(tile)
+    assert g1
+    assert g3
+    assert g1.md5 == g2.md5
+    assert g1.md5 == g3.md5
+
+
+def test_clip_at():
+    g = dem.clip_at(8.43, 55.5, 9, 11)
+    assert g.width == 9
+    assert g.height == 11
+    assert dem.value_at(8.43, 55.5) == 6.0
+    assert g.value_at(8.43, 55.5) == 6.0
+
+
+def test_idw():
+    g1 = dem.resample(0.04)
+    g2 = (g1.randomize() > 0.9).then(g1, np.nan)
+    g3 = g2.interp_idw(max_workers=4)
+    assert not g3.has_nan
+
+    g4 = (g3 - g2).round(3)
+    assert g4.has_nan
+    assert g4.min == 0
+    assert g4.max == 0

@@ -1,15 +1,19 @@
 import dataclasses
 import hashlib
 from base64 import b64encode
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from functools import cached_property
 from io import BytesIO
+from types import FunctionType
 from typing import (
     Any,
     Callable,
     Dict,
     Iterable,
+    List,
     Optional,
+    Sequence,
     Tuple,
     Union,
     cast,
@@ -19,6 +23,7 @@ from typing import (
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
+from matplotlib import patheffects
 from numpy import arctan, arctan2, cos, gradient, ndarray, pi, sin, sqrt
 from rasterio import DatasetReader, features
 from rasterio.crs import CRS
@@ -27,10 +32,12 @@ from rasterio.io import MemoryFile
 from rasterio.transform import Affine, from_bounds
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from rasterio.windows import Window
+from scipy.spatial.distance import cdist
 from shapely.geometry import Point, Polygon
 from shapely.geometry.base import BaseGeometry
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.neighbors import KernelDensity
 from sklearn.preprocessing import StandardScaler
 
 from glidergun._focal import Focal
@@ -43,9 +50,10 @@ from glidergun._literals import (
     ResamplingMethod,
 )
 from glidergun._prediction import Prediction
-from glidergun._types import CellSize, Extent, GridCore, PointValue, Scaler
+from glidergun._shapefile import Shapefile
+from glidergun._types import CellSize, Defaults, Extent, GridCore, PointValue, Scaler
 from glidergun._utils import (
-    create_parent_directory,
+    create_directory,
     format_type,
     get_crs,
     get_nodata_value,
@@ -56,8 +64,8 @@ Operand = Union["Grid", float, int]
 
 
 @dataclass(frozen=True)
-class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
-    display: Union[ColorMap, Any] = "gray"
+class Grid(GridCore, Interpolation, Prediction, Focal, Zonal, Shapefile):
+    display: Union[ColorMap, Any] = field(default_factory=lambda: Defaults.display)
 
     def __post_init__(self):
         self.data.flags.writeable = False
@@ -76,23 +84,44 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
             + f"cell: {self.cell_size.x}, {self.cell_size.y}"
         )
 
-    def _thumbnail(self, figsize: Optional[Tuple[float, float]] = None):
+    def _thumbnail(
+        self, figsize: Optional[Tuple[float, float]] = None, show_values: bool = False
+    ):
         with BytesIO() as buffer:
             figure = plt.figure(figsize=figsize, frameon=False)
             axes = figure.add_axes((0, 0, 1, 1))
             axes.axis("off")
-            n = 4000 / max(self.width, self.height)
-            if n < 1:
-                obj = self.resample(self.cell_size / n)
             obj = self.to_uint8_range()
             plt.imshow(obj.data, cmap=self.display)
+
+            if (
+                show_values
+                and self.dtype != "bool"
+                and self.width <= Defaults.annotation_threshold
+                and self.height <= Defaults.annotation_threshold
+            ):
+                for row in range(self.height):
+                    for column in range(self.width):
+                        value = self.data[row][column]
+                        plt.annotate(
+                            str(round(value, 2)),
+                            xy=(column + 0.02, row + 0.02),
+                            ha="center",
+                            va="center",
+                            color="white",
+                            fontsize=9,
+                            path_effects=[
+                                patheffects.withStroke(linewidth=1, foreground="black")
+                            ],
+                        )
+
             plt.savefig(buffer, bbox_inches="tight", pad_inches=0)
             plt.close(figure)
             return buffer.getvalue()
 
     @cached_property
     def img(self) -> str:
-        image = b64encode(self._thumbnail()).decode()
+        image = b64encode(self._thumbnail(show_values=True)).decode()
         return f"data:image/png;base64, {image}"
 
     @cached_property
@@ -264,16 +293,31 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
     __rlshift__ = __rshift__
 
     def __neg__(self):
-        return self.update(-1 * self.data)
+        return self.local(-1 * self.data)
 
     def __pos__(self):
-        return self.update(1 * self.data)
+        return self.local(1 * self.data)
 
     def __invert__(self):
         return con(self, False, True)
 
-    def update(self, data: ndarray):
-        return grid(data, self.transform, self.crs)
+    def is_greater_than(self, n: Operand):
+        return self > n
+
+    def is_less_than(self, n: Operand):
+        return self < n
+
+    def is_greater_than_or_equal(self, n: Operand):
+        return self >= n
+
+    def is_less_than_or_equal(self, n: Operand):
+        return self <= n
+
+    def is_equal(self, n: Operand):
+        return self == n
+
+    def is_not_equal(self, n: Operand):
+        return self != n
 
     def _data(self, n: Operand):
         if isinstance(n, Grid):
@@ -282,22 +326,18 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
 
     def _apply(self, left: Operand, right: Operand, op: Callable):
         if not isinstance(left, Grid) or not isinstance(right, Grid):
-            return self.update(op(self._data(left), self._data(right)))
+            return self.local(op(self._data(left), self._data(right)))
 
         if left.cell_size == right.cell_size and left.extent == right.extent:
-            return self.update(op(left.data, right.data))
+            return self.local(op(left.data, right.data))
 
         l_adjusted, r_adjusted = standardize(left, right)
 
-        return self.update(op(l_adjusted.data, r_adjusted.data))
+        return self.local(op(l_adjusted.data, r_adjusted.data))
 
-    def local(self, func: Callable[[ndarray], Any]):
-        return self.update(func(self.data))
-
-    def con(self, trueValue: Operand, falseValue: Operand):
-        return self.local(
-            lambda data: np.where(data, self._data(trueValue), self._data(falseValue))
-        )
+    def local(self, func: Union[Callable[[ndarray], ndarray], ndarray]):
+        data = func if isinstance(func, ndarray) else func(self.data)
+        return grid(data, self.transform, self.crs)
 
     def mosaic(self, *grids: "Grid"):
         grids_adjusted = standardize(self, *grids, extent="union")
@@ -417,10 +457,23 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
         height = (ymax - ymin) / abs(self.transform.e) / scaling_y
         return self._reproject(transform, self.crs, width, height, resampling)
 
+    def tiles(self, width: float, height: float):
+        for e in self.extent.tiles(width, height):
+            yield self.clip(*e)
+
     def clip(self, xmin: float, ymin: float, xmax: float, ymax: float):
         return self._resample(
             (xmin, ymin, xmax, ymax), self.cell_size, Resampling.nearest
         )
+
+    def clip_at(self, x: float, y: float, width: int = 8, height: int = 8):
+        x_offset = self.cell_size.x * width / 2
+        y_offset = self.cell_size.y * height / 2
+        xmin = x - x_offset
+        ymin = y - y_offset
+        xmax = x + x_offset
+        ymax = y + y_offset
+        return self.clip(xmin, ymin, xmax, ymax)
 
     def resample(
         self,
@@ -433,6 +486,16 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
             return self
         return self._resample(self.extent, cell_size, resampling)
 
+    def resize(
+        self,
+        width: int,
+        height: int,
+        resampling: Union[Resampling, ResamplingMethod] = "nearest",
+    ):
+        cell_size_x = self.cell_size.x * self.width / width
+        cell_size_y = self.cell_size.y * self.height / height
+        return self.resample((cell_size_x, cell_size_y), resampling)
+
     def buffer(self, value: Union[float, int], count: int):
         if count < 0:
             g = (self != value).buffer(1, -count)
@@ -442,24 +505,56 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
             g = con(g.focal_count(value, 1, True) > 0, value, g)
         return g
 
-    def distance(self, *points: Tuple[float, float]):
-        if not points:
-            points = tuple((p.x, p.y) for p in self.to_points() if p.value)
-        return distance(self.extent, self.crs, self.cell_size, *points)
+    def density(
+        self,
+        points: Optional[Sequence[Tuple[float, float]]] = None,
+        max_workers: int = 1,
+    ):
+        if points is None:
+            points = [(p.x, p.y) for p in self.to_points()]
+        return density(points, self.extent, self.crs, self.cell_size, max_workers)
 
-    def randomize(self):
-        return self.update(np.random.rand(self.height, self.width))
+    def distance(
+        self,
+        points: Optional[Sequence[Tuple[float, float]]] = None,
+        max_workers: int = 1,
+    ):
+        if points is None:
+            points = [(p.x, p.y) for p in self.to_points()]
+        return distance(points, self.extent, self.crs, self.cell_size, max_workers)
+
+    def interp_idw(
+        self,
+        points: Optional[Sequence[Tuple[float, float, float]]] = None,
+        cell_size: Union[Tuple[float, float], float, None] = None,
+        radius: Optional[float] = None,
+        max_workers: int = 1,
+    ):
+        if points is None:
+            points = self.to_points()
+        return idw(
+            points,
+            self.extent,
+            self.crs,
+            cell_size or self.cell_size,
+            radius,
+            max_workers,
+        )
+
+    def randomize(self, normal_distribution: bool = False):
+        f = np.random.randn if normal_distribution else np.random.rand
+        return self.local(f(self.height, self.width))
 
     def aspect(self, radians: bool = False):
         y, x = gradient(self.data)
-        g = self.update(arctan2(-y, x))
+        g = self.local(arctan2(-y, x))
         if radians:
             return g
         return (g.local(np.degrees) + 360) % 360
 
     def slope(self, radians: bool = False):
         y, x = gradient(self.data)
-        g = self.update(arctan(sqrt(x * x + y * y)))
+        g = self.local(arctan(sqrt(x * x + y * y)))
         if radians:
             return g
         return g.local(np.degrees)
@@ -472,65 +567,85 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
         shaded = sin(altitude) * sin(slope) + cos(altitude) * cos(slope) * cos(
             azimuth - aspect
         )
-        return self.update((255 * (shaded + 1) / 2))
+        return self.local((255 * (shaded + 1) / 2))
 
-    def reclass(self, *mapping: Tuple[float, float, float]):
-        conditions = [(self.data >= min) & (self.data < max) for min, max, _ in mapping]
-        values = [value for _, _, value in mapping]
-        return self.update(np.select(conditions, values, np.nan))
-
-    def percentile(self, percent: float) -> float:
-        return np.nanpercentile(self.data, percent)  # type: ignore
-
-    def slice(self, count: int, percent_clip: float = 0.1):
-        min = self.percentile(percent_clip)
-        max = self.percentile(100 - percent_clip)
-        interval = (max - min) / count
-        mapping = [
-            (
-                min + (i - 1) * interval if i > 1 else float("-inf"),
-                min + i * interval if i < count else float("inf"),
-                float(i),
-            )
-            for i in range(1, count + 1)
-        ]
-        return self.reclass(*mapping)
-
-    def replace(
-        self, value: Operand, replacement: Operand, fallback: Optional[Operand] = None
+    def con(
+        self,
+        predicate: Union[Operand, Callable[["Grid"], "Grid"]],
+        replacement: Operand,
+        fallback: Optional[Operand] = None,
     ):
+        if isinstance(predicate, FunctionType):
+            g = predicate(self)
+        elif isinstance(predicate, Grid):
+            g = predicate
+        else:
+            g = self == predicate
         return con(
-            value if isinstance(value, Grid) else self == value,
-            replacement,
-            self if fallback is None else fallback,
+            self.standardize(g)[1], replacement, self if fallback is None else fallback
         )
 
-    def set_nan(self, value: Operand, fallback: Optional[Operand] = None):
-        return self.replace(value, np.nan, fallback)
+    def set_nan(
+        self,
+        predicate: Union[Operand, Callable[["Grid"], "Grid"]],
+        fallback: Optional[Operand] = None,
+    ):
+        return self.con(predicate, np.nan, fallback)
 
-    def value(self, x: float, y: float) -> float:
-        xoff = (x - self.xmin) / self.transform.a
-        yoff = (y - self.ymax) / self.transform.e
-        if xoff < 0 or xoff >= self.width or yoff < 0 or yoff >= self.height:
+    def then(self, trueValue: Operand, falseValue: Operand):
+        return con(self, trueValue, falseValue)
+
+    def process_tiles(
+        self,
+        func: Callable[["Grid"], "Grid"],
+        tile_size: int = 256,
+        buffer: int = 0,
+        max_workers: int = 1,
+    ) -> "Grid":
+        cell_x, cell_y = self.cell_size
+        tiles = list(self.extent.tiles(cell_x * tile_size, cell_y * tile_size))
+
+        if len(tiles) <= 4:
+            return func(self)
+
+        x = buffer * cell_x
+        y = buffer * cell_y
+
+        def f(tile: Extent):
+            xmin, ymin, xmax, ymax = tile
+            g = func(self.clip(xmin - x, ymin - y, xmax + x, ymax + y))
+            if buffer == 0:
+                return g
+            return g.clip(xmin, ymin, xmax, ymax)
+
+        result: Optional["Grid"] = None
+
+        if max_workers > 1:
+            with ThreadPoolExecutor(max_workers or 1) as executor:
+                for r in executor.map(f, tiles):
+                    result = result.mosaic(r) if result else r
+        else:
+            for i, tile in enumerate(tiles):
+                print(f"Processing tile {i + 1} of {len(tiles)}...")
+                result = result.mosaic(f(tile)) if result else f(tile)
+
+        assert result
+        return result
+
+    def value_at(self, x: float, y: float) -> float:
+        c = int((x - self.xmin) / self.cell_size.x)
+        r = int((self.ymax - y) / self.cell_size.y)
+        if c < 0 or c >= self.width or r < 0 or r >= self.height:
             return float(np.nan)
-        return float(self.data[int(yoff), int(xoff)])
+        return float(self.data[r, c])
 
     @cached_property
     def data_extent(self) -> Extent:
         if not self.has_nan:
             return self.extent
-        xmin, ymin, xmax, ymax = None, None, None, None
-        for x, y, _ in self.to_points():
-            if not xmin or x < xmin:
-                xmin = x
-            if not ymin or y < ymin:
-                ymin = y
-            if not xmax or x > xmax:
-                xmax = x
-            if not ymax or y > ymax:
-                ymax = y
-        if xmin is None or ymin is None or xmax is None or ymax is None:
-            raise ValueError("None of the cells has a value.")
+        points = self._coords_with_values()
+        xmin, ymin = points[:, :2].min(axis=0)
+        xmax, ymax = points[:, :2].max(axis=0)
         return Extent(
             xmin - self.cell_size.x / 2,
             ymin - self.cell_size.y / 2,
@@ -538,24 +653,40 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
             ymax + self.cell_size.y / 2,
         )
 
-    def to_points(self) -> Iterable[PointValue]:
-        for y, row in enumerate(self.data):
-            for x, value in enumerate(row):
-                if np.isfinite(value):
-                    yield PointValue(
-                        self.xmin + (x + 0.5) * self.cell_size.x,
-                        self.ymax - (y + 0.5) * self.cell_size.y,
-                        float(value),
-                    )
+    def _xs(self):
+        offset = self.cell_size.x / 2
+        return np.linspace(self.xmin + offset, self.xmax - offset, self.width)
 
-    def to_polygons(self) -> Iterable[Tuple[Polygon, float]]:
+    def _ys(self):
+        offset = self.cell_size.y / 2
+        return np.linspace(self.ymax - offset, self.ymin + offset, self.height)
+
+    def _coords(self):
+        x, y = np.meshgrid(self._xs(), self._ys())
+        return np.asarray(np.column_stack([x.ravel(), y.ravel()]), "float32")
+
+    def _coords_with_values(self, include_nan: bool = False):
+        x, y = np.meshgrid(self._xs(), self._ys())
+        array = np.column_stack([x.ravel(), y.ravel(), self.data.ravel()])
+        if include_nan:
+            return array
+        return array[~np.isnan(array[:, 2])]
+
+    def to_points(self, include_nan: bool = False) -> List[PointValue]:
+        return [
+            PointValue(float(x), float(y), float(v))
+            for x, y, v in self._coords_with_values(include_nan)
+        ]
+
+    def to_polygons(self, include_nan: bool = False) -> List[Tuple[Polygon, float]]:
         g = self * 1
-        for shape, value in features.shapes(
-            g.data, mask=np.isfinite(g.data), transform=g.transform
-        ):
-            if np.isfinite(value):
-                coordinates = shape["coordinates"]
-                yield Polygon(coordinates[0], coordinates[1:]), float(value)
+        mask = None if include_nan else np.isfinite(g.data)
+        return [
+            (Polygon(shape["coordinates"][0], shape["coordinates"][1:]), float(value))
+            for shape, value in features.shapes(
+                g.data, mask=mask, transform=g.transform
+            )
+        ]
 
     def rasterize(
         self,
@@ -577,7 +708,7 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
             all_touched=all_touched,
             default_value=np.nan,  # type: ignore
         )
-        return self.update(array)
+        return self.local(array)
 
     def to_stack(self):
         from glidergun._stack import stack
@@ -587,8 +718,44 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
         grid3 = grid2 / grid2.max
         arrays = plt.get_cmap(self.display)(grid3.data).transpose(2, 0, 1)[:3]  # type: ignore
         mask = self.is_nan()
-        r, g, b = [self.update(a * 253 + 1).set_nan(mask) for a in arrays]
+        r, g, b = [self.local(a * 253 + 1).set_nan(mask) for a in arrays]
         return stack(r, g, b)
+
+    def percentile(self, percent: float) -> float:
+        return np.nanpercentile(self.data, percent)  # type: ignore
+
+    def percent_clip(self, min_percent: float, max_percent: float):
+        min_value = self.percentile(min_percent)
+        max_value = self.percentile(max_percent)
+
+        if min_value == max_value:
+            return self
+
+        return self.cap_range(min_value, max_value)
+
+    def to_uint8_range(self):
+        if self.dtype == "bool" or self.min > 0 and self.max < 255:
+            return self
+        return self.percent_clip(0.1, 99.9).stretch(1, 254)
+
+    def reclass(self, *mapping: Tuple[float, float, float]):
+        conditions = [(self.data >= min) & (self.data < max) for min, max, _ in mapping]
+        values = [value for _, _, value in mapping]
+        return self.local(np.select(conditions, values, np.nan))
+
+    def slice(self, count: int, percent_clip: float = 0.1):
+        min = self.percentile(percent_clip)
+        max = self.percentile(100 - percent_clip)
+        interval = (max - min) / count
+        mapping = [
+            (
+                min + (i - 1) * interval if i > 1 else float("-inf"),
+                min + i * interval if i < count else float("inf"),
+                float(i),
+            )
+            for i in range(1, count + 1)
+        ]
+        return self.reclass(*mapping)
 
     def stretch(self, min_value: float, max_value: float):
         expected_range = max_value - min_value
@@ -610,30 +777,16 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
         return con(self > value, np.nan if set_nan else value, self)
 
     def kmeans_cluster(self, n_clusters: int, nodata: float = 0.0, **kwargs):
-        g = self.is_nan().con(nodata, self)
+        g = self.is_nan().then(nodata, self)
         kmeans = KMeans(n_clusters=n_clusters, **kwargs).fit(g.data.reshape(-1, 1))
         data = kmeans.cluster_centers_[kmeans.labels_].reshape(self.data.shape)
-        result = self.update(data)
+        result = self.local(data)
         return result.set_nan(self.is_nan())
 
     def scale(self, scaler: Scaler, **fit_params):
         g = cast("Grid", self)
         result = g.local(lambda a: scaler.fit_transform(a, **fit_params))
         return result
-
-    def percent_clip(self, min_percent: float, max_percent: float):
-        min_value = self.percentile(min_percent)
-        max_value = self.percentile(max_percent)
-
-        if min_value == max_value:
-            return self
-
-        return self.cap_range(min_value, max_value)
-
-    def to_uint8_range(self):
-        if self.dtype == "bool" or self.min > 0 and self.max < 255:
-            return self
-        return self.percent_clip(0.1, 99.9).stretch(1, 254)
 
     def hist(self, **kwargs):
         return plt.bar(list(self.bins.keys()), list(self.bins.values()), **kwargs)
@@ -693,7 +846,7 @@ class Grid(GridCore, Interpolation, Prediction, Focal, Zonal):
             g = con(g.is_nan(), nodata, g)
 
         if isinstance(file, str):
-            create_parent_directory(file)
+            create_directory(file)
             with rasterio.open(
                 file,
                 "w",
@@ -925,14 +1078,16 @@ def grid(
         case w, h if isinstance(w, int) and isinstance(h, int):
             array = np.arange(w * h).reshape(h, w)
         case _:
-            assert cell_size
-            extent = cast(Tuple[float, float, float, float], extent)
+            assert extent, "Extent is required."
+            assert cell_size, "Cell size is required."
 
             if isinstance(data, (int, float)):
                 if isinstance(cell_size, (int, float)):
                     cell_size = CellSize(cell_size, cell_size)
                 else:
                     cell_size = CellSize(*cell_size)
+                extent = Extent(*extent)
+                extent.assert_valid()
                 xmin, ymin, xmax, ymax = extent
                 width = int((xmax - xmin) / cell_size.x + 0.5)
                 height = int((ymax - ymin) / cell_size.y + 0.5)
@@ -1006,7 +1161,9 @@ def con(grid: Grid, trueValue: Operand, falseValue: Operand):
     Returns:
         Grid: A new grid.
     """
-    return grid.con(trueValue, falseValue)
+    return grid.local(
+        lambda data: np.where(data, grid._data(trueValue), grid._data(falseValue))
+    )
 
 
 def standardize(
@@ -1066,7 +1223,7 @@ def standardize(
 def _aggregate(func: Callable, *grids: Grid) -> Grid:
     grids_adjusted = standardize(*grids)
     data = func(np.array([grid.data for grid in grids_adjusted]), axis=0)
-    return grids_adjusted[0].update(data)
+    return grids_adjusted[0].local(data)
 
 
 def mean(*grids: Grid) -> Grid:
@@ -1085,36 +1242,93 @@ def maximum(*grids: Grid) -> Grid:
     return _aggregate(np.max, *grids)
 
 
-def distance(
+def density(
+    points: Sequence[Tuple[float, float]],
     extent: Tuple[float, float, float, float],
     crs: Union[int, CRS],
     cell_size: Union[Tuple[float, float], float],
-    *points: Tuple[float, float],
+    max_workers: int = 1,
 ):
     g = grid(np.nan, extent, crs, cell_size)
 
     if len(points) == 0:
-        raise ValueError("Distance function requires at least one point.")
+        return g
 
-    if len(points) > 1000:
-        raise ValueError("Distance function only accepts up to 1000 points.")
+    def f(g: Grid) -> Grid:
+        kernel_density = KernelDensity()
+        kernel_density.fit(np.array(points))
+        result = np.exp(kernel_density.score_samples(g._coords()))
+        return g.local(result.reshape(g.height, g.width))
 
-    if len(points) > 1:
-        grids = [distance(extent, crs, cell_size, p) for p in points]
-        return minimum(*grids)
+    return g.process_tiles(f, 256, 0, max_workers)
 
-    point = list(points)[0]
-    w = int((g.extent.xmax - g.extent.xmin) / g.cell_size.x)
-    h = int((g.extent.ymax - g.extent.ymin) / g.cell_size.y)
-    dx = int((g.extent.xmin - point[0]) / g.cell_size.x)
-    dy = int((point[1] - g.extent.ymax) / g.cell_size.y)
-    data = np.meshgrid(
-        np.array(range(dx, w + dx)) * g.cell_size.x,
-        np.array(range(dy, h + dy)) * g.cell_size.y,
-    )
-    gx = grid(data[0], g.transform, g.crs)
-    gy = grid(data[1], g.transform, g.crs)
-    return (gx**2 + gy**2) ** (1 / 2)
+
+def distance(
+    points: Sequence[Tuple[float, float]],
+    extent: Tuple[float, float, float, float],
+    crs: Union[int, CRS],
+    cell_size: Union[Tuple[float, float], float],
+    max_workers: int = 1,
+):
+    g = grid(np.nan, extent, crs, cell_size)
+
+    if len(points) == 0:
+        return g
+
+    def f(g: Grid) -> Grid:
+        distances = cdist(g._coords(), np.array(points))
+        result = distances.min(axis=1)
+        return g.local(result.reshape(g.height, g.width))
+
+    return g.process_tiles(f, 256, 0, max_workers)
+
+
+def idw(
+    points: Sequence[Tuple[float, float, float]],
+    extent: Tuple[float, float, float, float],
+    crs: Union[int, CRS],
+    cell_size: Union[Tuple[float, float], float],
+    radius: Optional[float] = None,
+    max_workers: int = 1,
+):
+    g = grid(np.nan, extent, crs, cell_size)
+
+    if len(points) == 0:
+        return g
+
+    def f(g: Grid) -> Grid:
+        if radius:
+            e = Extent(
+                g.extent.xmin - radius,
+                g.extent.ymin - radius,
+                g.extent.xmax + radius,
+                g.extent.ymax + radius,
+            )
+            points_adjusted = [p for p in points if e.intersects(*p[:2], *p[:2])]
+            if not points_adjusted:
+                return g
+        else:
+            points_adjusted = points
+
+        x, y, v = zip(*points_adjusted)
+        values = np.array(v)
+        coords = g._coords()
+        xi, yi = coords[:, 0], coords[:, 1]
+        distances = np.asarray(
+            (xi[:, None] - x) ** 2 + (yi[:, None] - y) ** 2, "float32"
+        )
+        distances[distances == 0] = 1e-10
+        weights = 1 / distances
+
+        if radius:
+            mask = distances > radius**2
+            distances[mask] = np.inf
+            weights[mask] = 0
+
+        result = np.dot(weights / weights.sum(axis=1, keepdims=True), values)
+        return g.local(result.reshape(g.height, g.width))
+
+    return g.process_tiles(f, 256, 0, max_workers)
 
 
 def pca(n_components: int = 1, *grids: Grid) -> Tuple[Grid, ...]:
@@ -1129,4 +1343,4 @@ def pca(n_components: int = 1, *grids: Grid) -> Tuple[Grid, ...]:
         .transpose((1, 0))
     )
     g = grids_adjusted[0]
-    return tuple(g.update(a.reshape((g.height, g.width))) for a in arrays)
+    return tuple(g.local(a.reshape((g.height, g.width))) for a in arrays)
